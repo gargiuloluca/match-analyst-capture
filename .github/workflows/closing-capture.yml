@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write   # serve solo al commit vuoto anti-sospensione (ultimo passaggio)
 
 concurrency:
   group: atm-capture
@@ -48,3 +48,18 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+
+      # GitHub sospende i workflow programmati dopo 60 giorni senza attivita' nella repo.
+      # Se l'ultimo commit ha piu' di 45 giorni, ne facciamo uno vuoto (nessun file, nessun dato).
+      - name: Keep repository active
+        run: |
+          last=$(git log -1 --format=%ct)
+          now=$(date +%s)
+          if [ $(( (now - last) / 86400 )) -ge 45 ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "keepalive"
+            git push
+          else
+            echo "Repo attiva: nessun commit necessario."
+          fi
