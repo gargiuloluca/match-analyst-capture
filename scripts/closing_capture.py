@@ -138,6 +138,53 @@ def load_trackers():
     return out
 
 
+def load_log_index():
+    """{event_id: ultima chiusura registrata} da closing_log.jsonl (tutta la storia)."""
+    idx = {}
+    if LOG_FILE.exists():
+        for line in LOG_FILE.read_text(encoding="utf-8").splitlines():
+            try:
+                d = json.loads(line)
+                idx[d["id"]] = d
+            except Exception:
+                pass
+    return idx
+
+
+def backfill_from_log(trackers, log_idx):
+    """Per OGNI giocata (qualsiasi motore, qualsiasi stato) senza quota di chiusura, la ricava dal registro delle chiusure.
+    Cosi tutte le partite catturate contano per il CLV, anche se la giocata non era 'in attesa' al momento della cattura."""
+    filled = 0
+    missing = {"nessuna_chiusura_registrata": 0, "mercato_non_coperto": 0}
+    miss_mk = {}
+    for t in trackers.values():
+        for b in t["bets"]:
+            if float(b.get("closing_odd") or 0) > 1.0:
+                continue
+            ent = log_idx.get(b.get("event_id") or b.get("match_id"))
+            if not ent:
+                missing["nessuna_chiusura_registrata"] += 1
+                continue
+            mk = str(b.get("market_key", ""))
+            if b.get("price_basis") == "pinnacle_quoted":
+                fo = (ent.get("o") or {}).get(mk.upper())
+            else:
+                fo = fair_odd_for(mk, ent.get("p") or {})
+            if fo and fo > 1.0:
+                b["closing_odd"] = round(fo, 3)
+                b["closing_src"] = "pinnacle_capture_log"
+                b["closing_ts"] = ent.get("ts")
+                try:
+                    b["clv_live_pct"] = round((float(b.get("odd", 0)) / fo - 1.0) * 100, 2)
+                except Exception:
+                    pass
+                filled += 1
+            else:
+                missing["mercato_non_coperto"] += 1
+                miss_mk[mk] = miss_mk.get(mk, 0) + 1
+    return filled, missing, miss_mk
+
+
 def main():
     now = datetime.now(timezone.utc)
     if not API_KEYS:
@@ -158,11 +205,23 @@ def main():
         mins = (ko - now).total_seconds() / 60.0
         if WINDOW_MIN <= mins <= WINDOW_MAX:
             todo.setdefault(f.get("sport_key"), []).append(f.get("id"))
+    trackers = load_trackers()
+    log_idx = load_log_index()
+    filled, missing, miss_mk = backfill_from_log(trackers, log_idx)
+    print(f"[Capture] Recupero dal registro: {filled} giocate con chiusura aggiunta | senza chiusura: "
+          f"{missing['nessuna_chiusura_registrata']} (partita mai catturata) + {missing['mercato_non_coperto']} (mercato non coperto"
+          f"{': ' + ', '.join(f'{k}={v}' for k, v in sorted(miss_mk.items(), key=lambda x: -x[1])[:6]) if miss_mk else ''})")
+
+    def save_trackers():
+        for name, t in trackers.items():
+            (DATA_DIR / name).write_text(json.dumps(t, ensure_ascii=False, indent=2), encoding="utf-8")
+
     if not todo:
+        if filled:
+            save_trackers()
         print("[Capture] Nessuna partita tra 5 e 45 minuti da registrare. 0 crediti usati.")
         return
 
-    trackers = load_trackers()
     pend = {}   # event_id -> lista di scommesse in attesa
     for t in trackers.values():
         for b in t["bets"]:
@@ -204,9 +263,8 @@ def main():
     if log_lines:
         with LOG_FILE.open("a", encoding="utf-8") as fh:
             fh.write("\n".join(log_lines) + "\n")
-    if updated:
-        for name, t in trackers.items():
-            (DATA_DIR / name).write_text(json.dumps(t, ensure_ascii=False, indent=2), encoding="utf-8")
+    if updated or filled:
+        save_trackers()
     print(f"[Capture] {len(todo)} campionati chiamati (~{credits} crediti) | {len(log_lines)} chiusure registrate | "
           f"{updated} giocate con quota di chiusura aggiornata.")
 
